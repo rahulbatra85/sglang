@@ -419,15 +419,15 @@ def _fwd_grouped_kernel_stage2(
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DMODEL], dtype=tl.float32)
-
-    for start_n in range(0, cur_batch_seq_len, BLOCK_N):
+    log2e = 1.44269504
+    loop_num = tl.cdiv(cur_batch_seq_len, BLOCK_N) - 1
+    #for start_n in range(0, cur_batch_seq_len, BLOCK_N):
+    for start_n in range(0, loop_num*BLOCK_N, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         v_index = tl.load(
             Req_to_tokens
             + cur_batch_req_idx * stride_req_to_token_b
             + (start_n + offs_n),
-            mask=(start_n + offs_n) < cur_batch_seq_len,
-            other=0,
         )
 
         offs_qk = cur_head[:, None] * stride_logic_h + (
@@ -441,8 +441,8 @@ def _fwd_grouped_kernel_stage2(
         )
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        old_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
+        old_scale = tl.exp2((e_max - n_e_max)*log2e)
+        p = tl.exp2((qk - n_e_max[:, None])*log2e)
         e_sum = e_sum * old_scale + tl.sum(p, 1)
         v = tl.load(
             v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv)
@@ -451,7 +451,37 @@ def _fwd_grouped_kernel_stage2(
         acc = acc * old_scale[:, None] + tl.dot(p, v)
         e_max = n_e_max
 
+    start_n = loop_num * BLOCK_N
+    v_index = tl.load(
+        Req_to_tokens
+        + cur_batch_req_idx * stride_req_to_token_b
+        + (start_n + offs_n),
+        mask=(start_n + offs_n) < cur_batch_seq_len,
+        other=0,
+    )
+
+    offs_qk = cur_head[:, None] * stride_logic_h + (
+        cur_batch_start_loc + start_n + offs_n[None, :]
+    )
+
+    qk = tl.load(
+        logits + offs_qk,
+        mask=mask_h[:, None] & (start_n + offs_n[None, :] < cur_batch_seq_len),
+        other=float("-inf"),
+    )
+
+    n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+    old_scale = tl.exp2((e_max - n_e_max)*log2e)
+    p = tl.exp2((qk - n_e_max[:, None])*log2e)
+    e_sum = e_sum * old_scale + tl.sum(p, 1)
+    v = tl.load(
+        v_ptrs + v_index[:, None] * stride_buf_vbs, mask=(offs_d[None, :] < Lv)
+    )
+    p = p.to(v.dtype)
+    acc = acc * old_scale[:, None] + tl.dot(p, v)
+    e_max = n_e_max
     acc = acc / e_sum[:, None]
+
     off_o = cur_batch * stride_obs + cur_head[:, None] * stride_oh + offs_d[None, :]
     out_ptrs = Out + off_o
     tl.store(out_ptrs, acc, mask=(mask_h[:, None]) & (offs_d[None, :] < Lv))
@@ -492,7 +522,7 @@ def _decode_grouped_att_m_fwd(
         triton.cdiv(max_len_in_batch, BLOCK),
     )
 
-    num_warps = 4
+    num_warps = 8
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -537,11 +567,12 @@ def _decode_grouped_softmax_reducev_fwd(
     BLOCK_H = max(16, triton.next_power_of_2(kv_group_num))
     grid = (batch, triton.cdiv(head_num, min(BLOCK_H, kv_group_num)), 1)
 
-    num_warps = 8
+    num_warps = 8 
 
     Lv = v_buffer.shape[-1]
     BLOCK_DMODEL = triton.next_power_of_2(Lv)
 
+    #print(f"RB: BLOCK_DMODEL={BLOCK_DMODEL} !!!!!!")
     _fwd_grouped_kernel_stage2[grid](
         logits,
         v_buffer,
