@@ -79,6 +79,7 @@ def _fwd_kernel(
     cur_head = tl.program_id(1)
     cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
+    log2e = 1.44269504
 
     cur_seq_len = tl.load(B_Seq_Len + cur_seq)
     cur_seq_len_extend = tl.load(B_Seq_Len_Extend + cur_seq)
@@ -162,8 +163,8 @@ def _fwd_kernel(
         qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
+        re_scale = tl.exp2((e_max - n_e_max)*log2e)
+        p = tl.exp2((qk - n_e_max[:, None])*log2e)
         deno = deno * re_scale + tl.sum(p, 1)
 
         offs_buf_v = (
@@ -223,8 +224,8 @@ def _fwd_kernel(
         qk = tl.where(mask_causual, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
+        re_scale = tl.exp2((e_max - n_e_max)*log2e)
+        p = tl.exp2((qk - n_e_max[:, None])*log2e)
         deno = deno * re_scale + tl.sum(p, 1)
 
         offs_v = (
@@ -246,8 +247,10 @@ def _fwd_kernel(
         + cur_head * stride_oh
         + offs_dv[None, :]
     )
+    l = 1 / deno[:, None]
+    acc = acc * l
     tl.store(
-        O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
+        O_Extend + offs_o, acc, mask=mask_m[:, None] & mask_dv[None, :]
     )
 
 
@@ -289,33 +292,41 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
-        if Lq <= 256:
-            BLOCK_M, BLOCK_N = (128, 64)
-        else:
-            BLOCK_M, BLOCK_N = (32, 64)
-    elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
-        if Lq <= 128:
-            BLOCK_M, BLOCK_N = (128, 128)
-        elif Lq <= 256:
-            BLOCK_M, BLOCK_N = (64, 64)
-        else:
-            BLOCK_M, BLOCK_N = (32, 64)
-    else:
-        BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+    #if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
+    #    if Lq <= 256:
+    #        BLOCK_M, BLOCK_N = (128, 64)
+    #    else:
+    #        BLOCK_M, BLOCK_N = (32, 64)
+    #elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
+    #    if Lq <= 128:
+    #        BLOCK_M, BLOCK_N = (128, 128)
+    #    elif Lq <= 256:
+    #        BLOCK_M, BLOCK_N = (64, 64)
+    #    else:
+    #        BLOCK_M, BLOCK_N = (32, 64)
+    #else:
+    #    BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
+    BLOCK_M, BLOCK_N = (64, 64)
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = b_seq_len.shape[0], q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_warps = 4 if Lk <= 64 else 8
+    #num_warps = 4 if Lk <= 64 else 8
+    num_warps = 4
     num_stages = 1
 
     extra_kargs = {}
     if is_hip():
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+        if grid[0] * grid[1] * grid[2] <= 304: #Fix this so it's not MI300 specific
+            waves_per_eu = 2
+        else:
+            waves_per_eu = 4
+        extra_kargs = {"waves_per_eu": waves_per_eu, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    #print(f"RB: gri2={grid}, q_dtype={q_extend.dtype} k_dtype={k_extend.dtype}, v_dtype={v_extend.dtype}")
     _fwd_kernel[grid](
         q_extend,
         k_extend,
