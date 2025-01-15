@@ -62,7 +62,7 @@ def int4_to_fp8_dequant(
 
     # Dequantize.
     qweights = qweights  * scales
-    out = qweights.to(tl.float8e4m3fnuz).reshape(K/8, N)
+    out = qweights.to(tl.fp8e4b8).reshape(K/8, N)
 
     return out
 
