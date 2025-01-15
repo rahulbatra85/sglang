@@ -36,35 +36,35 @@ enable_moe_align_block_size_triton = bool(
 def int4_to_fp8_dequant(
         qweights,  # quantized matrix, K/8 x N
         scales,  # scales, per channel (N,)
-        K: tl.constexpr,
+        K8: tl.constexpr, #K/8
         N: tl.constexpr
 ):
+    #tl.device_print("in_qweights", qweights)
+    qweights = qweights.trans(1,0) #(N,K8)
+    qweights = tl.interleave(qweights, qweights) 
     qweights = tl.interleave(qweights, qweights)
-    qweights = tl.interleave(qweights, qweights)
-    qweights = tl.interleave(qweights, qweights)
+    weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
 
-    # Create reverse  order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
-    # that will map given indices to the correct order.
     reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
                                 tl.arange(0, 4)[:, None]).reshape(8)
-
+    
     # Use this to compute a set of shifts that can be used to unpack and
-    # reorder the values in iweights and zeros.
+    # reorder the values in weights
     shifts = reverse_order_tensor * 4
-    shifts = tl.broadcast_to(shifts[None, :], (K/8*N, 8))
-    shifts = tl.reshape(shifts, (1, K*N))
+    shifts = tl.broadcast_to(shifts[None, :], (K8*N, 8)) #(K8*N,8)
+    shifts = tl.reshape(shifts, (N, K8*8)).trans(1,0) #(K,N)
+    #tl.device_print("shifts", shifts)
 
     # Unpack and reorder: shift out the correct 4-bit value and mask.
-    qweights = (qweights >> shifts) & 0xF
+    weights = (weights >> shifts) & 0xF #(K,N)
 
-    # Compute scale offsets and masks.
-    scales = tl.broadcast_to(scales, (1, K))
+    scales = tl.broadcast_to(scales[None, :], (K8*8,N))
+    #tl.device_print("scales", scales)
+    dweights = weights * scales
+    dweights = dweights.to(tl.float8e4b8)
+    #tl.device_print("dweights", dweights)
 
-    # Dequantize.
-    qweights = qweights  * scales
-    out = qweights.to(tl.fp8e4b8).reshape(K/8, N)
-
-    return out
+    return dweights
 
 @triton.jit
 def fused_moe_kernel(
@@ -241,7 +241,7 @@ def fused_moe_kernel(
             if use_int4_w4:
                 #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
                 b_int4 = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
-                b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0]*8, b_int4.shape[1])
+                b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
             else:
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
@@ -567,12 +567,17 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
+    #TODO: Have these passed to this function. Just dummies for now
+    use_int4_w = False
+    B_scale_int4 = torch.zeros((B.shape[1], B.shape[2])) # (E,N)
+
     fused_moe_kernel[grid](
         A,
         B,
         C,
         A_scale,
         B_scale,
+        B_scale_int4
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -593,6 +598,8 @@ def invoke_fused_moe_kernel(
         B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
         B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
         B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+        B_scale_int4.stride(0) if B_scale_int4 is not None and B_scale_int4.ndim == 2 else 0,
+        B_scale_int4.stride(1) if B_scale_int4 is not None and B_scale_int4.ndim == 2 else 0,
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
@@ -601,6 +608,7 @@ def invoke_fused_moe_kernel(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         even_Ks=even_Ks,
+        use_int4_w=use_int4_w, 
         **config,
     )
 
