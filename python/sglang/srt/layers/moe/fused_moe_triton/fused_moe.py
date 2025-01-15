@@ -32,6 +32,39 @@ enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
 
+@triton.jit
+def int4_to_fp8_dequant(
+        qweights,  # quantized matrix, K/8 x N
+        scales,  # scales, per channel (N,)
+        K: tl.constexpr,
+        N: tl.constexpr
+):
+    qweights = tl.interleave(qweights, qweights)
+    qweights = tl.interleave(qweights, qweights)
+    qweights = tl.interleave(qweights, qweights)
+
+    # Create reverse  order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
+    # that will map given indices to the correct order.
+    reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
+                                tl.arange(0, 4)[:, None]).reshape(8)
+
+    # Use this to compute a set of shifts that can be used to unpack and
+    # reorder the values in iweights and zeros.
+    shifts = reverse_order_tensor * 4
+    shifts = tl.broadcast_to(shifts[None, :], (K/8*N, 8))
+    shifts = tl.reshape(shifts, (1, K*N))
+
+    # Unpack and reorder: shift out the correct 4-bit value and mask.
+    qweights = (qweights >> shifts) & 0xF
+
+    # Compute scale offsets and masks.
+    scales = tl.broadcast_to(scales, (1, K))
+
+    # Dequantize.
+    qweights = qweights  * scales
+    out = qweights.to(tl.float8e4m3fnuz).reshape(K/8, N)
+
+    return out
 
 @triton.jit
 def fused_moe_kernel(
@@ -41,6 +74,7 @@ def fused_moe_kernel(
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
+    b_scale_int4_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -66,6 +100,8 @@ def fused_moe_kernel(
     stride_bse,
     stride_bsk,
     stride_bsn,
+    stride_bsie,
+    stride_bsin,
     # Block size for block-wise quantization
     group_n: tl.constexpr,
     group_k: tl.constexpr,
@@ -80,6 +116,7 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
+    use_int4_w: tl.constexpr = 0,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -135,16 +172,26 @@ def fused_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_k_8 = tl.arange(0, BLOCK_SIZE_K // 8)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
-    b_ptrs = (
-        b_ptr
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    if use_int4_w:
+        #load 1/8 th elements in B in the K direction 
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k_8[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
+    else:
+        #load regular
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
     if use_int8_w8a16:
         b_scale_ptrs = (
             b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
@@ -161,6 +208,12 @@ def fused_moe_kernel(
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+    if use_int4_w4:
+        #load b int4 scale
+        b_scale_int4_ptrs = (
+                    b_scale_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
+        )
+        b_scale_int4 = tl.load(b_scale_int4_ptr)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -185,7 +238,12 @@ def fused_moe_kernel(
                 mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            if use_int4_w4:
+                #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
+                b_int4 = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
+                b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0]*8, b_int4.shape[1])
+            else:
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         # We accumulate along the K dimension.
         if use_int8_w8a16:
@@ -206,7 +264,11 @@ def fused_moe_kernel(
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        if use_int4_w4:
+            b_ptrs += BLOCK_SIZE_K/8 * stride_bk
+        else:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
