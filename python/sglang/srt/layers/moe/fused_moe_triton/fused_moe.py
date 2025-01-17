@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import direct_register_custom_op, get_device_name, is_hip
 
+invoke_cnt = 0
 is_hip_flag = False
 if not is_hip():
     from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
@@ -211,10 +212,11 @@ def fused_moe_kernel(
             b_scale = tl.load(b_scale_ptr + off_experts)
     if use_int4_w:
         #load b int4 scale
-        b_scale_int4_ptrs = (
-                    b_scale_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
-        )
-        b_scale_int4 = tl.load(b_scale_int4_ptrs)
+        #b_scale_int4_ptrs = (
+        #            b_scale_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
+        #)
+        #b_scale_int4 = tl.load(b_scale_int4_ptrs)
+        b_scale_int4 = tl.full((1,BLOCK_SIZE_N),1, dtype=tl.float32)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -247,7 +249,7 @@ def fused_moe_kernel(
             )
             if use_int4_w:
                 #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
-                b_int4 = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
+                b_int4 = tl.load(b_ptrs, mask=offs_k8[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
                 b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
             else:
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
@@ -545,6 +547,10 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+    global invoke_cnt
+    invoke_cnt +=1
+    print(f"RB: invoke_cnt={invoke_cnt}")
+
     padded_size = 0
     if use_fp8_w8a8:
         assert B_scale is not None
@@ -582,6 +588,12 @@ def invoke_fused_moe_kernel(
     if B_scale_int4 is not None:
         use_int4_w = True
 
+    #print(f"RB: A.shape={A.shape},B.shape={B.shape},C.shape={C.shape}, B_scale_int4.shape={B_scale_int4.shape}")
+    #print(f"RB: A.stride={A.stride()},B.stride={B.stride()},C.stride={C.stride()}, B_scale_int4.shape={B_scale_int4.stride()}")
+    #blk_sz_m = config["BLOCK_SIZE_M"]
+    #blk_sz_n = config["BLOCK_SIZE_N"]
+    #blk_sz_k = config["BLOCK_SIZE_K"]
+    #print(f"RB: blk_sz_m={blk_sz_m},blk_sz_m={blk_sz_n},blk_sz_m={blk_sz_k},")
     fused_moe_kernel[grid](
         A,
         B,
