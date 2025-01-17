@@ -56,7 +56,8 @@ def int4_to_fp8_dequant(
     #tl.device_print("shifts", shifts)
 
     # Unpack and reorder: shift out the correct 4-bit value and mask.
-    weights = (weights >> shifts) & 0xF #(K,N)
+    weights = ((weights >> shifts) & 0xF) #(K,N)
+    weights = tl.where(weights >= 8, weights - 16, weights)
 
     #scales = tl.broadcast_to(scales[None, :], (K8*8,N))
     scales = tl.broadcast_to(scales[:], (K8*8,N))
