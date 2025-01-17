@@ -212,7 +212,7 @@ def fused_moe_kernel(
     if use_int4_w:
         #load b int4 scale
         b_scale_int4_ptrs = (
-                    b_scale_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
+                    b_scale_int4_ptr + off_experts * stride_bsie + offs_bn[None, :] * stride_bsin
         )
         b_scale_int4 = tl.load(b_scale_int4_ptrs)
 
@@ -247,7 +247,7 @@ def fused_moe_kernel(
             )
             if use_int4_w:
                 #size (BLOCK_SIZE_K /8, BLOCK_SIZE_N)
-                b_int4 = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
+                b_int4 = tl.load(b_ptrs, mask=offs_k8[:, None] < (K - k)*BLOCK_SIZE_K/8, other=0.0) 
                 b = int4_to_fp8_dequant(b_int4, b_scale_int4, b_int4.shape[0], b_int4.shape[1])
             else:
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
