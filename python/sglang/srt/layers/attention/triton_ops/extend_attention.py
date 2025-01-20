@@ -74,6 +74,8 @@ def _fwd_kernel(
     BLOCK_DV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    EVEN_D: tl.constexpr,
+    EVEN_DV: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -103,9 +105,14 @@ def _fwd_kernel(
         + cur_head * stride_qh
         + offs_d[None, :]
     )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
+    if EVEN_D:
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]), other=0.0
+        )
+    else:     
+        q = tl.load(
+            Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
+        )
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
@@ -138,9 +145,14 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_kh
             + offs_d[:, None]
         )
-        k = tl.load(
-            K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-        )
+        if EVEN_D:
+            k = tl.load(
+                K_Buffer + offs_buf_k, mask=(mask_n[None, :]), other=0.0
+            )
+        else:
+            k = tl.load(
+                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+            )
 
         qk = tl.dot(q.to(k.dtype), k)
         if BLOCK_DPE > 0:
@@ -172,9 +184,15 @@ def _fwd_kernel(
             + cur_kv_head * stride_buf_vh
             + offs_dv[None, :]
         )
-        v = tl.load(
-            V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-        )
+        if EVEN_DV:
+            v = tl.load(
+                V_Buffer + offs_buf_v, mask=mask_n[:, None], other=0.0
+            )
+        else:
+            v = tl.load(
+                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+            )
+
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -193,9 +211,14 @@ def _fwd_kernel(
             + cur_kv_head * stride_kh
             + offs_d[:, None]
         )
-        k = tl.load(
-            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-        )
+        if EVEN_D:
+            k = tl.load(
+                K_Extend + offs_k, mask=(mask_n[None, :]), other=0.0
+            )
+        else:
+            k = tl.load(
+                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+            )
 
         qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
@@ -233,9 +256,14 @@ def _fwd_kernel(
             + cur_kv_head * stride_vh
             + offs_dv[None, :]
         )
-        v = tl.load(
-            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-        )
+        if EVEN_DV:
+            v = tl.load(
+                V_Extend + offs_v, mask=mask_n[:, None], other=0.0
+            )
+        else:
+            v = tl.load(
+                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+            )
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -291,7 +319,10 @@ def extend_attention_fwd(
         BLOCK_DMODEL = triton.next_power_of_2(Lq)
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
-
+    if BLOCK_DV == Lv:
+        EVEN_DV = True
+    if BLOCK_DMODEL == Lq:
+        EVEN_D = True
     #if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
     #    if Lq <= 256:
     #        BLOCK_M, BLOCK_N = (128, 64)
@@ -364,6 +395,8 @@ def extend_attention_fwd(
         Lv=Lv,
         num_warps=num_warps,
         num_stages=num_stages,
+        EVEN_D=EVEN_D,
+        EVEN_DV=EVEN_DV,
         **extra_kargs,
     )
 
