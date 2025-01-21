@@ -131,13 +131,18 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    unmasked_loop_num = tl.cdiv(cur_seq_len_prefix, BLOCK_N)
+    if unmasked_loop_num > 0:
+        unmasked_loop_num -=1
+    #tl.device_print("unmasked_loop_num",unmasked_loop_num)
+    #for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    for start_n in range(0, unmasked_loop_num*BLOCK_N, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_seq_len_prefix
+        #mask_n = (start_n + offs_n) < cur_seq_len_prefix
         offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
             cur_seq_prefix_start_in_loc + start_n + offs_n
         )
-        offs_kv_loc = tl.load(Req_to_tokens + offs_b_loc_prefix, mask=mask_n, other=0)
+        offs_kv_loc = tl.load(Req_to_tokens + offs_b_loc_prefix)
 
         # load k in transposed way
         offs_buf_k = (
@@ -147,11 +152,11 @@ def _fwd_kernel(
         )
         if EVEN_D:
             k = tl.load(
-                K_Buffer + offs_buf_k, mask=(mask_n[None, :]), other=0.0
+                K_Buffer + offs_buf_k
             )
         else:
             k = tl.load(
-                K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+                K_Buffer + offs_buf_k, mask=(mask_d[:, None]), other=0.0
             )
 
         qk = tl.dot(q.to(k.dtype), k)
@@ -162,9 +167,7 @@ def _fwd_kernel(
                 + offs_dpe[:, None]
             )
             kpe = tl.load(
-                K_Buffer + offs_kpe,
-                mask=mask_n[None, :],
-                other=0.0,
+                K_Buffer + offs_kpe
             )
             qk += tl.dot(qpe.to(kpe.dtype), kpe)
         qk *= sm_scale
@@ -172,7 +175,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+        qk = tl.where(mask_m[:, None], qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp2((e_max - n_e_max)*log2e)
@@ -186,11 +189,11 @@ def _fwd_kernel(
         )
         if EVEN_DV:
             v = tl.load(
-                V_Buffer + offs_buf_v, mask=mask_n[:, None], other=0.0
+                V_Buffer + offs_buf_v 
             )
         else:
             v = tl.load(
-                V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                V_Buffer + offs_buf_v, mask_dv[None, :], other=0.0
             )
 
         p = p.to(v.dtype)
@@ -198,12 +201,84 @@ def _fwd_kernel(
 
         e_max = n_e_max
 
+    start_n = unmasked_loop_num*BLOCK_N
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    mask_n = (start_n + offs_n) < cur_seq_len_prefix
+    offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
+        cur_seq_prefix_start_in_loc + start_n + offs_n
+    )
+    offs_kv_loc = tl.load(Req_to_tokens + offs_b_loc_prefix, mask=mask_n, other=0)
+
+    # load k in transposed way
+    offs_buf_k = (
+        offs_kv_loc[None, :] * stride_buf_kbs
+        + cur_kv_head * stride_buf_kh
+        + offs_d[:, None]
+    )
+    if EVEN_D:
+        k = tl.load(
+            K_Buffer + offs_buf_k, mask=(mask_n[None, :]), other=0.0
+        )
+    else:
+        k = tl.load(
+            K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
+
+    qk = tl.dot(q.to(k.dtype), k)
+    if BLOCK_DPE > 0:
+        offs_kpe = (
+            offs_kv_loc[None, :] * stride_buf_kbs
+            + cur_kv_head * stride_buf_kh
+            + offs_dpe[:, None]
+        )
+        kpe = tl.load(
+            K_Buffer + offs_kpe,
+            mask=mask_n[None, :],
+            other=0.0,
+        )
+        qk += tl.dot(qpe.to(kpe.dtype), kpe)
+    qk *= sm_scale
+
+    if logit_cap > 0:
+        qk = logit_cap * tanh(qk / logit_cap)
+
+    qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+
+    n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+    re_scale = tl.exp2((e_max - n_e_max)*log2e)
+    p = tl.exp2((qk - n_e_max[:, None])*log2e)
+    deno = deno * re_scale + tl.sum(p, 1)
+
+    offs_buf_v = (
+        offs_kv_loc[:, None] * stride_buf_vbs
+        + cur_kv_head * stride_buf_vh
+        + offs_dv[None, :]
+    )
+    if EVEN_DV:
+        v = tl.load(
+            V_Buffer + offs_buf_v, mask=mask_n[:, None], other=0.0
+        )
+    else:
+        v = tl.load(
+            V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
+
+    p = p.to(v.dtype)
+    acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+    e_max = n_e_max
+
     # stage 2: compute the trianlge part
 
     cur_block_m_end = tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
+    unmasked_loop_num1 = tl.cdiv(cur_block_m_end, BLOCK_N)
+    #tl.device_print("unmasked_loop_num1", unmasked_loop_num1)
+    if unmasked_loop_num1 > 0:
+        unmasked_loop_num1 -=1
+    #for start_n in range(0, cur_block_m_end, BLOCK_N):
+    for start_n in range(0, unmasked_loop_num1*BLOCK_N, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_n = (start_n + offs_n) < cur_block_m_end
+        #mask_n = (start_n + offs_n) < cur_block_m_end
 
         # load k in transposed way
         offs_k = (
@@ -213,11 +288,11 @@ def _fwd_kernel(
         )
         if EVEN_D:
             k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]), other=0.0
+                K_Extend + offs_k
             )
         else:
             k = tl.load(
-                K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+                K_Extend + offs_k, (mask_d[:, None]), other=0.0
             )
 
         qk = tl.dot(q, k, out_dtype=tl.float32)
@@ -229,9 +304,7 @@ def _fwd_kernel(
                 + offs_dpe[:, None]
             )
             kpe = tl.load(
-                K_Extend + offs_kpe,
-                mask=mask_n[None, :],
-                other=0.0,
+                K_Extend + offs_kpe
             )
             qk += tl.dot(qpe, kpe)
 
@@ -243,7 +316,7 @@ def _fwd_kernel(
         mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
             start_n + offs_n[None, :]
         )
-        mask_causual &= mask_m[:, None] & mask_n[None, :]
+        mask_causual &= mask_m[:, None] 
         qk = tl.where(mask_causual, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
@@ -258,17 +331,84 @@ def _fwd_kernel(
         )
         if EVEN_DV:
             v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None], other=0.0
+                V_Extend + offs_v
             )
         else:
             v = tl.load(
-                V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+                V_Extend + offs_v, mask_dv[None, :], other=0.0
             )
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
         e_max = n_e_max
 
+    start_n = unmasked_loop_num1*BLOCK_N 
+    start_n = tl.multiple_of(start_n, BLOCK_N)
+    mask_n = (start_n + offs_n) < cur_block_m_end
+
+    # load k in transposed way
+    offs_k = (
+        (cur_seq_extend_start_contiguous + start_n + offs_n[None, :]) * stride_kbs
+        + cur_kv_head * stride_kh
+        + offs_d[:, None]
+    )
+    if EVEN_D:
+        k = tl.load(
+            K_Extend + offs_k, mask=(mask_n[None, :]), other=0.0
+        )
+    else:
+        k = tl.load(
+            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
+        )
+
+    qk = tl.dot(q, k, out_dtype=tl.float32)
+    if BLOCK_DPE > 0:
+        offs_kpe = (
+            (cur_seq_extend_start_contiguous + start_n + offs_n[None, :])
+            * stride_kbs
+            + cur_kv_head * stride_kh
+            + offs_dpe[:, None]
+        )
+        kpe = tl.load(
+            K_Extend + offs_kpe,
+            mask=mask_n[None, :],
+            other=0.0,
+        )
+        qk += tl.dot(qpe, kpe)
+
+    qk *= sm_scale
+
+    if logit_cap > 0:
+        qk = logit_cap * tanh(qk / logit_cap)
+
+    mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
+        start_n + offs_n[None, :]
+    )
+    mask_causual &= mask_m[:, None] & mask_n[None, :]
+    qk = tl.where(mask_causual, qk, float("-inf"))
+
+    n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+    re_scale = tl.exp2((e_max - n_e_max)*log2e)
+    p = tl.exp2((qk - n_e_max[:, None])*log2e)
+    deno = deno * re_scale + tl.sum(p, 1)
+
+    offs_v = (
+        (cur_seq_extend_start_contiguous + start_n + offs_n[:, None]) * stride_vbs
+        + cur_kv_head * stride_vh
+        + offs_dv[None, :]
+    )
+    if EVEN_DV:
+        v = tl.load(
+            V_Extend + offs_v, mask=mask_n[:, None], other=0.0
+        )
+    else:
+        v = tl.load(
+            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
+        )
+    p = p.to(v.dtype)
+    acc = acc * re_scale[:, None] + tl.dot(p, v)
+
+    e_max = n_e_max
     offs_o = (
         (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
