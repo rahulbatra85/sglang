@@ -40,10 +40,14 @@ def int4_to_fp8_dequant(
         N: tl.constexpr
 ):
     #tl.device_print("in_qweights", qweights)
-    qweights = qweights.trans(1,0) #(N,K8)
-    qweights = tl.interleave(qweights, qweights) 
-    qweights = tl.interleave(qweights, qweights)
-    weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
+    #qweights = qweights.trans(1,0) #(N,K8)
+    #qweights = tl.interleave(qweights, qweights) 
+    #qweights = tl.interleave(qweights, qweights)
+    #weights = tl.interleave(qweights, qweights).trans(1,0) #(K,N)
+
+    eweights = tl.expand_dims(qweights, 1)
+    eweights = tl.broadcast_to(eweights, (K8, 8, N)) 
+    weights = tl.reshape(eweights, (K8*8, N))
 
     reverse_order_tensor = ((tl.arange(0, 2) * 4)[None, :] +
                                 tl.arange(0, 4)[:, None]).reshape(8)
@@ -983,6 +987,9 @@ def fused_experts_impl(
     if not use_fp8_w8a8 or block_shape is not None:
         padded_size = 0
 
+    #print(f"fused_experts_impl, RB:  hidden_states.shape={hidden_states.shape}")
+    #print(f"fused_experts_impl, RB:  w1.shape={w1.shape},w2.shape={w2.shape},topk_weights.shape={topk_weights.shape},topk_ids.shape={topk_ids.shape}")
+    #print(f"w1_scale, RB: w1_scale={w1_scale.shape},w2_scale={w2_scale.shape},a1_scale={a1_scale.shape},a2_scale={a2_scale.shape}, w1_scale1={w1_scale1.shape},w2_scale1={w2_scale1.shape}, ")
     # Check constraints.
     assert hidden_states.shape[1] == ((w1.shape[2] - padded_size)*8), "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
